@@ -20,7 +20,10 @@ const { run } = (await import(new URL('./solve.js', import.meta.url).href)) as {
 const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
-const cases = JSON.parse(readFileSync(join(INPUT_DIR, 'cases.json'), 'utf8')) as { id: string; input: unknown }[];
+// The cases are read and parsed up front, then answered one by one in
+// order; the answers are written as one JSON array, in the cases' order.
+const raw = readFileSync(join(INPUT_DIR, 'cases.json'), 'utf8');
+const cases = JSON.parse(raw) as { id: string; input: unknown }[];
 const answers: unknown[] = [];
 for (const c of cases) answers.push(run(c.input));
 writeFileSync(join(OUTPUT_DIR, 'answers.json'), JSON.stringify(answers));
