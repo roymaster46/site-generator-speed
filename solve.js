@@ -392,6 +392,60 @@ function parseTemplate(name, src) {
   return root.body;
 }
 
+/**
+ * Compile a parsed template to a function: the same nodes, rendered without
+ * the per-node dispatch of the tree walk. Returns { fn, paths } or null when
+ * the template cannot be compiled (the tree walk then renders it instead).
+ * The generated function is (S, C, D, P, L, T, U, R): scope, context,
+ * include depth, the template's paths, lookup, textOf, truthy, renderNodes.
+ * Includes thread the same arguments through, so a compiled template calls
+ * a compiled include directly and falls back to the tree walk for one that
+ * did not compile.
+ */
+function compileTemplate(nodes) {
+  const paths = [];
+  let uid = 0;
+  const gen = (ns, scopeVar) => {
+    let code = '';
+    for (const node of ns) {
+      if (node.kind === 'text') {
+        code += `o+=${JSON.stringify(node.text)};`;
+      } else if (node.kind === 'var') {
+        const pi = paths.length;
+        paths.push(node.path);
+        code += `o+=C.escape(T(L(${scopeVar},P[${pi}])));`;
+      } else if (node.kind === 'raw') {
+        const pi = paths.length;
+        paths.push(node.path);
+        code += `o+=T(L(${scopeVar},P[${pi}]));`;
+      } else if (node.kind === 'if') {
+        const pi = paths.length;
+        paths.push(node.path);
+        code += `if(U(L(${scopeVar},P[${pi}]))!==${node.not}){${gen(node.then, scopeVar)}`;
+        if (node.else !== null) code += `}else{${gen(node.else, scopeVar)}`;
+        code += '}';
+      } else if (node.kind === 'for') {
+        const pi = paths.length;
+        paths.push(node.path);
+        const xs = `_a${uid++}`;
+        const k = `_a${uid++}`;
+        const sv = `_a${uid++}`;
+        code += `{const ${xs}=L(${scopeVar},P[${pi}]);if(Array.isArray(${xs})){for(let ${k}=0;${k}<${xs}.length;${k}++){const ${sv}={vars:{${JSON.stringify(node.name)}:${xs}[${k}],loop:{index:${k}+1,first:${k}===0,last:${k}===${xs}.length-1,length:${xs}.length}},parent:${scopeVar}};${gen(node.body, sv)}}}}`;
+      } else if (node.kind === 'include') {
+        const t = `_a${uid++}`;
+        code += `{const ${t}=C.templates.get(${JSON.stringify(node.name)});if(${t}!==undefined&&D<8)o+=(${t}.fn!==null?${t}.fn(${scopeVar},C,D+1,${t}.paths,L,T,U,R):R(${t}.nodes,${scopeVar},C,D+1));}`;
+      }
+    }
+    return code;
+  };
+  try {
+    const fn = new Function('S', 'C', 'D', 'P', 'L', 'T', 'U', 'R', `let o='';${gen(nodes, 'S')}return o;`);
+    return { fn, paths };
+  } catch {
+    return null;
+  }
+}
+
 /** The value at `path` in the scope chain: its first name from the nearest scope holding it, then own properties. */
 function lookup(scope, path) {
   let s = scope;
@@ -454,8 +508,10 @@ function renderNodes(nodes, scope, ctx, depth) {
         break;
       }
       case 'include': {
-        const t = ctx.templates.get(node.name);
-        if (t !== undefined && depth < INCLUDE_DEPTH) out += renderNodes(t, scope, ctx, depth + 1);
+        const rec = ctx.templates.get(node.name);
+        if (rec !== undefined && depth < INCLUDE_DEPTH) {
+          out += rec.fn !== null ? rec.fn(scope, ctx, depth + 1, rec.paths, lookup, textOf, truthy, renderNodes) : renderNodes(rec.nodes, scope, ctx, depth + 1);
+        }
         break;
       }
     }
@@ -976,8 +1032,10 @@ function layouts(b) {
   const recent = b.posts.slice(0, b.input.site.recent).map((p) => b.cards.get(p));
   const ctx = { templates: b.templates, escape: escapeHtml };
   const render = (name, vars) => {
-    const nodes = b.templates.get(name);
-    return nodes === undefined ? null : renderNodes(nodes, { vars: { site, tags: allTags, recent, ...vars }, parent: null }, ctx, 0);
+    const t = b.templates.get(name);
+    if (t === undefined) return null;
+    const scope = { vars: { site, tags: allTags, recent, ...vars }, parent: null };
+    return t.fn !== null ? t.fn(scope, ctx, 0, t.paths, lookup, textOf, truthy, renderNodes) : renderNodes(t.nodes, scope, ctx, 0);
   };
   for (const s of b.sources) b.output[`${s.outDir}/index.html`] = render(s.layout, { page: pageObjs.get(s) });
   const per = b.input.site.per_page;
@@ -1019,7 +1077,9 @@ export function run(input) {
   const report = [];
   for (const name of Object.keys(input.templates).sort(byCodeUnits)) {
     try {
-      templates.set(name, parseTemplate(name, input.templates[name]));
+      const nodes = parseTemplate(name, input.templates[name]);
+      const compiled = compileTemplate(nodes);
+      templates.set(name, { nodes, fn: compiled !== null ? compiled.fn : null, paths: compiled !== null ? compiled.paths : null });
     } catch (err) {
       if (!(err instanceof TemplateError)) throw err;
       report.push(err.message);
